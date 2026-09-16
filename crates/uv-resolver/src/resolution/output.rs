@@ -3,6 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexSet;
 use petgraph::{
     Directed, Direction,
@@ -10,17 +11,21 @@ use petgraph::{
 };
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
+use uv_client::{FileHashError, RegistryClient};
 use uv_configuration::{BuildOptions, Constraints, Overrides};
 use uv_distribution::Metadata;
 use uv_distribution_types::{
-    BuiltDist, Dist, DistributionId, Edge, HashCollection, Identifier, IndexUrl, Name, Node,
-    Requirement, RequiresPython, ResolutionDiagnostic, ResolvedDist, SourceDist, parse_url_hashes,
+    BuiltDist, Dist, DistributionId, Edge, FileLocation, HashCollection, Identifier, IndexUrl,
+    Name, Node, Requirement, RequiresPython, ResolutionDiagnostic, ResolvedDist, SourceDist,
+    parse_url_hashes,
 };
 use uv_git::GitResolver;
 use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep440::{Version, VersionSpecifier};
 use uv_pep508::{MarkerEnvironment, MarkerTree, MarkerTreeKind};
-use uv_pypi_types::{Conflicts, HashDigests, ParsedUrl, ParsedUrlError, VerbatimParsedUrl, Yanked};
+use uv_pypi_types::{
+    Conflicts, HashDigest, HashDigests, ParsedUrl, ParsedUrlError, VerbatimParsedUrl, Yanked,
+};
 use uv_types::HashStrategy;
 
 use crate::graph_ops::{marker_reachability, simplify_conflict_markers};
@@ -168,7 +173,6 @@ impl ResolverOutput {
                     package,
                     version,
                     project == Some(&package.name) || workspace_members.contains(&package.name),
-                    &options,
                 )?;
             }
         }
@@ -339,7 +343,6 @@ impl ResolverOutput {
         package: &'a ResolutionPackage,
         version: &'a Version,
         is_workspace_member: bool,
-        options: &Options,
     ) -> Result<(), ResolveError> {
         let ResolutionPackage {
             name,
@@ -360,7 +363,6 @@ impl ResolverOutput {
             hasher,
             in_memory,
             git,
-            options,
         )?;
 
         // We normally write dependency paths relative to the lockfile. For the current project and
@@ -431,7 +433,6 @@ impl ResolverOutput {
         hasher: &HashStrategy,
         in_memory: &InMemoryIndex,
         git: &GitResolver,
-        options: &Options,
     ) -> Result<(ResolvedDist, HashDigests, Option<Metadata>), ResolveError> {
         Ok(if let Some(url) = url {
             // Create the locked distribution and recover the metadata using the original URL that
@@ -509,7 +510,6 @@ impl ResolverOutput {
                 hasher,
                 in_memory,
             );
-            let hashes = Self::filter_hashes(&dist, hashes, in_memory, options);
 
             // Extract the metadata.
             let metadata = {
@@ -621,62 +621,6 @@ impl ResolverOutput {
         HashDigests::empty()
     }
 
-    /// Restrict registry hashes to artifacts allowed by the libc policy and build options.
-    /// If none remain, use the hashes of the allowed artifacts.
-    fn filter_hashes(
-        dist: &ResolvedDist,
-        hashes: HashDigests,
-        in_memory: &InMemoryIndex,
-        options: &Options,
-    ) -> HashDigests {
-        if !options.supported_environments.has_libc_constraints() {
-            return hashes;
-        }
-        let ResolvedDist::Installable { dist, .. } = dist else {
-            return hashes;
-        };
-        let (wheels, sdist) = match dist.as_ref() {
-            Dist::Built(BuiltDist::Registry(dist)) => (&dist.wheels, dist.sdist.as_ref()),
-            Dist::Source(SourceDist::Registry(dist)) => (&dist.wheels, Some(dist)),
-            Dist::Built(BuiltDist::DirectUrl(_) | BuiltDist::Path(_) | BuiltDist::GitPath(_))
-            | Dist::Source(
-                SourceDist::DirectUrl(_)
-                | SourceDist::GitDirectory(_)
-                | SourceDist::GitPath(_)
-                | SourceDist::Path(_)
-                | SourceDist::Directory(_),
-            ) => return hashes,
-        };
-        let mut allowed_hashes = wheels
-            .iter()
-            .filter(|_| !options.build_options.no_binary_package(dist.name()))
-            .flat_map(|wheel| wheel.file.hashes.iter())
-            .chain(
-                sdist
-                    .filter(|_| !options.build_options.no_build_package(dist.name()))
-                    .into_iter()
-                    .flat_map(|source| source.file.hashes.iter()),
-            )
-            .collect::<FxHashSet<_>>();
-        // Flat indexes may omit hashes. Reuse hashes computed for the installation artifact,
-        // not a different wheel used only to read metadata.
-        let metadata_response = in_memory.distributions().get(&dist.distribution_id());
-        if let Some(response) = &metadata_response
-            && let MetadataResponse::Found(archive) = &**response
-        {
-            allowed_hashes.extend(archive.hashes.iter());
-        }
-        let mut hashes = hashes
-            .into_iter()
-            .filter(|hash| allowed_hashes.contains(hash))
-            .collect::<Vec<_>>();
-        if hashes.is_empty() {
-            hashes.extend(allowed_hashes.into_iter().cloned());
-            hashes.sort_unstable();
-        }
-        HashDigests::from(hashes)
-    }
-
     /// Returns an iterator over the distinct packages in the graph.
     fn dists(&self) -> impl Iterator<Item = &AnnotatedDist> {
         self.graph
@@ -705,6 +649,91 @@ impl ResolverOutput {
     /// Return `true` if there are no packages in the graph.
     pub fn is_empty(&self) -> bool {
         self.base_dists().next().is_none()
+    }
+
+    /// Generate registry hashes from the artifacts retained by a libc policy and build options.
+    ///
+    /// Existing requirements hashes have no artifact association. When filtering artifacts, use
+    /// advertised hashes or hash the retained files instead of reusing an ambiguous subset.
+    pub async fn generate_artifact_hashes(
+        &mut self,
+        client: &RegistryClient,
+        concurrency: usize,
+        omit: &[PackageName],
+    ) -> Result<(), FileHashError> {
+        if !self.options.supported_environments.has_libc_constraints() {
+            return Ok(());
+        }
+        let build_options = &self.options.build_options;
+        let mut hashes = FxHashMap::<NodeIndex, Vec<HashDigest>>::default();
+        let mut missing = FxHashMap::<&FileLocation, Vec<NodeIndex>>::default();
+        for index in self.graph.node_indices() {
+            let ResolutionGraphNode::Dist(distribution) = &self.graph[index] else {
+                continue;
+            };
+            if omit.contains(&distribution.name) {
+                continue;
+            }
+            let ResolvedDist::Installable { dist, .. } = &distribution.dist else {
+                continue;
+            };
+            let (wheels, sdist) = match dist.as_ref() {
+                Dist::Built(BuiltDist::Registry(dist)) => (&dist.wheels, dist.sdist.as_ref()),
+                Dist::Source(SourceDist::Registry(dist)) => (&dist.wheels, Some(dist)),
+                Dist::Built(
+                    BuiltDist::DirectUrl(_) | BuiltDist::Path(_) | BuiltDist::GitPath(_),
+                )
+                | Dist::Source(
+                    SourceDist::DirectUrl(_)
+                    | SourceDist::GitDirectory(_)
+                    | SourceDist::GitPath(_)
+                    | SourceDist::Path(_)
+                    | SourceDist::Directory(_),
+                ) => continue,
+            };
+            let files = wheels
+                .iter()
+                .filter(|_| !build_options.no_binary_package(&distribution.name))
+                .map(|wheel| &wheel.file)
+                .chain(
+                    sdist
+                        .filter(|_| !build_options.no_build_package(&distribution.name))
+                        .into_iter()
+                        .map(|source| &source.file),
+                );
+            let hashes = hashes.entry(index).or_default();
+            for file in files {
+                if file.hashes.is_empty() {
+                    missing.entry(&file.url).or_default().push(index);
+                } else {
+                    hashes.extend(file.hashes.iter().cloned());
+                }
+            }
+        }
+
+        // A file shared by several forks, extras, or groups only needs to be hashed once.
+        let computed = futures::stream::iter(missing)
+            .map(|(location, indexes)| async move {
+                let hash = client.hash_file(&location.to_url()?).await?;
+                Ok::<_, FileHashError>((indexes, hash))
+            })
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
+        for (indexes, hash) in computed {
+            for index in indexes {
+                hashes.entry(index).or_default().push(hash.clone());
+            }
+        }
+        for (index, mut hashes) in hashes {
+            let ResolutionGraphNode::Dist(distribution) = &mut self.graph[index] else {
+                continue;
+            };
+            hashes.sort_unstable();
+            hashes.dedup();
+            distribution.hashes = HashDigests::from(hashes);
+        }
+        Ok(())
     }
 
     /// Retain registry hashes only for artifacts permitted by package-specific build options.
