@@ -629,7 +629,7 @@ impl ResolverOutput {
         in_memory: &InMemoryIndex,
         options: &Options,
     ) -> HashDigests {
-        if !options.artifact_environments.has_libc_constraints() {
+        if !options.supported_environments.has_libc_constraints() {
             return hashes;
         }
         let ResolvedDist::Installable { dist, .. } = dist else {

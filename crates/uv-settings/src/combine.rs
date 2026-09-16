@@ -8,11 +8,11 @@ use uv_configuration::{
     Reinstall, RequiredVersion, TargetTriple, TrustedPublishing, Upgrade,
 };
 use uv_distribution_types::{
-    ConfigSettings, ExtraBuildVariables, Index, IndexUrl, PackageConfigSettings, PipExtraIndex,
-    PipFindLinks, PipIndex, RequiredEnvironments,
+    ConfigSettings, Environments, ExtraBuildVariables, Index, IndexUrl, PackageConfigSettings,
+    PipExtraIndex, PipFindLinks, PipIndex,
 };
 use uv_install_wheel::LinkMode;
-use uv_pypi_types::{SchemaConflicts, SupportedEnvironments};
+use uv_pypi_types::SchemaConflicts;
 use uv_python::{PythonDownloads, PythonPreference, PythonVersion};
 use uv_redacted::DisplaySafeUrl;
 use uv_resolver::{
@@ -98,7 +98,7 @@ impl_combine_or!(ExcludeNewerOverride);
 impl_combine_or!(ExcludeNewerValue);
 impl_combine_or!(ExportFormat);
 impl_combine_or!(ForkStrategy);
-impl_combine_or!(RequiredEnvironments);
+impl_combine_or!(Environments);
 impl_combine_or!(Index);
 impl_combine_or!(IndexStrategy);
 impl_combine_or!(IndexUrl);
@@ -120,7 +120,6 @@ impl_combine_or!(RequiredVersion);
 impl_combine_or!(ResolutionMode);
 impl_combine_or!(SchemaConflicts);
 impl_combine_or!(String);
-impl_combine_or!(SupportedEnvironments);
 impl_combine_or!(TargetTriple);
 impl_combine_or!(TorchMode);
 impl_combine_or!(TrustedPublishing);

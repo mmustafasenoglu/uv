@@ -10,8 +10,8 @@ use uv_configuration::{
     ProxyUrl, Reinstall, RequiredVersion, TargetTriple, TrustedHost, TrustedPublishing, Upgrade,
 };
 use uv_distribution_types::{
-    ConfigSettings, ExtraBuildVariables, Index, IndexLocations, IndexUrl, IndexUrlError, Origin,
-    PackageConfigSettings, PipExtraIndex, PipFindLinks, PipIndex, RequiredEnvironments,
+    ConfigSettings, Environments, ExtraBuildVariables, Index, IndexLocations, IndexUrl,
+    IndexUrlError, Origin, PackageConfigSettings, PipExtraIndex, PipFindLinks, PipIndex,
     StaticMetadata,
 };
 use uv_install_wheel::LinkMode;
@@ -19,7 +19,7 @@ use uv_macros::{CombineOptions, OptionsMetadata};
 use uv_normalize::{ExtraName, PackageName, PipGroupName};
 use uv_pep508::Requirement;
 use uv_preview::{MaybePreviewFeature, Preview};
-use uv_pypi_types::{SupportedEnvironments, VerbatimParsedUrl};
+use uv_pypi_types::VerbatimParsedUrl;
 use uv_python::{PythonDownloads, PythonPreference, PythonVersion};
 use uv_redacted::DisplaySafeUrl;
 use uv_resolver::{
@@ -163,10 +163,10 @@ pub struct Options {
     pub build_constraint_dependencies: Option<Vec<BuildConstraintDependency>>,
 
     #[cfg_attr(feature = "schemars", schemars(skip))]
-    pub environments: Option<SupportedEnvironments>,
+    pub environments: Option<Environments>,
 
     #[cfg_attr(feature = "schemars", schemars(skip))]
-    pub required_environments: Option<RequiredEnvironments>,
+    pub required_environments: Option<Environments>,
 
     // NOTE(charlie): These fields should be kept in-sync with `ToolUv` in
     // `crates/uv-workspace/src/pyproject.rs`. The documentation lives on that struct.
@@ -2639,8 +2639,8 @@ struct OptionsWire {
     exclude_dependencies: Option<Vec<ExcludeDependency>>,
     constraint_dependencies: Option<Vec<Requirement<VerbatimParsedUrl>>>,
     build_constraint_dependencies: Option<Vec<BuildConstraintDependency>>,
-    environments: Option<SupportedEnvironments>,
-    required_environments: Option<RequiredEnvironments>,
+    environments: Option<Environments>,
+    required_environments: Option<Environments>,
 
     // NOTE(charlie): These fields should be kept in-sync with `ToolUv` in
     // `crates/uv-workspace/src/pyproject.rs`. The documentation lives on that struct.
