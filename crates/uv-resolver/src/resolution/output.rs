@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
 
+use futures::{StreamExt, TryStreamExt};
 use indexmap::IndexSet;
 use petgraph::{
     Directed, Direction,
@@ -10,17 +11,21 @@ use petgraph::{
 };
 use rustc_hash::{FxBuildHasher, FxHashMap, FxHashSet};
 
+use uv_client::{FileHashError, RegistryClient};
 use uv_configuration::{BuildOptions, Constraints, Overrides};
 use uv_distribution::Metadata;
 use uv_distribution_types::{
-    BuiltDist, Dist, DistributionId, Edge, HashCollection, Identifier, IndexUrl, Name, Node,
-    Requirement, RequiresPython, ResolutionDiagnostic, ResolvedDist, SourceDist, parse_url_hashes,
+    BuiltDist, Dist, DistributionId, Edge, FileLocation, HashCollection, Identifier, IndexUrl,
+    Name, Node, Requirement, RequiresPython, ResolutionDiagnostic, ResolvedDist, SourceDist,
+    parse_url_hashes,
 };
 use uv_git::GitResolver;
 use uv_normalize::{ExtraName, GroupName, PackageName};
 use uv_pep440::{Version, VersionSpecifier};
 use uv_pep508::{MarkerEnvironment, MarkerTree, MarkerTreeKind};
-use uv_pypi_types::{Conflicts, HashDigests, ParsedUrl, ParsedUrlError, VerbatimParsedUrl, Yanked};
+use uv_pypi_types::{
+    Conflicts, HashDigest, HashDigests, ParsedUrl, ParsedUrlError, VerbatimParsedUrl, Yanked,
+};
 use uv_types::HashStrategy;
 
 use crate::graph_ops::{marker_reachability, simplify_conflict_markers};
@@ -227,11 +232,7 @@ impl ResolverOutput {
             report_missing_lower_bounds(&graph, &mut diagnostics, &constraints, &overrides);
         }
 
-        let filter_artifact_hashes = !options.artifact_policy().is_empty()
-            && resolutions
-                .iter()
-                .all(|resolution| resolution.env.marker_environment().is_none());
-        let mut output = Self {
+        let output = Self {
             graph,
             requires_python,
             fork_markers,
@@ -241,9 +242,6 @@ impl ResolverOutput {
             overrides,
             options,
         };
-        if filter_artifact_hashes {
-            output.enforce_artifact_hashes(index);
-        }
 
         // We only do conflicting distribution detection when no
         // conflicting groups have been specified. The reason here
@@ -685,55 +683,89 @@ impl ResolverOutput {
         }
     }
 
-    /// Restrict registry hashes to artifacts retained by the universal artifact policy and build
-    /// options. If no existing hashes survive, replace them with known allowed hashes, which may be
-    /// empty: hashes reused from a lockfile must not reintroduce excluded artifacts.
-    fn enforce_artifact_hashes(&mut self, in_memory: &InMemoryIndex) {
+    /// Generate registry hashes from the artifacts retained by a libc cutoff and build options.
+    ///
+    /// Existing requirements hashes have no artifact association. When filtering artifacts, use
+    /// advertised hashes or hash the retained files instead of reusing an ambiguous subset.
+    pub async fn generate_artifact_hashes(
+        &mut self,
+        client: &RegistryClient,
+        concurrency: usize,
+        omit: &[PackageName],
+    ) -> Result<(), FileHashError> {
+        if self.options.minimum_libc_version.is_none() {
+            return Ok(());
+        }
         let build_options = &self.options.build_options;
-        for node in self.graph.node_weights_mut() {
-            let ResolutionGraphNode::Dist(distribution) = node else {
+        let mut hashes = FxHashMap::<NodeIndex, Vec<HashDigest>>::default();
+        let mut missing = FxHashMap::<&FileLocation, Vec<NodeIndex>>::default();
+        for index in self.graph.node_indices() {
+            let ResolutionGraphNode::Dist(distribution) = &self.graph[index] else {
                 continue;
             };
+            if omit.contains(&distribution.name) {
+                continue;
+            }
             let ResolvedDist::Installable { dist, .. } = &distribution.dist else {
                 continue;
             };
             let (wheels, sdist) = match dist.as_ref() {
                 Dist::Built(BuiltDist::Registry(dist)) => (&dist.wheels, dist.sdist.as_ref()),
                 Dist::Source(SourceDist::Registry(dist)) => (&dist.wheels, Some(dist)),
-                _ => continue,
+                Dist::Built(
+                    BuiltDist::DirectUrl(_) | BuiltDist::Path(_) | BuiltDist::GitPath(_),
+                )
+                | Dist::Source(
+                    SourceDist::DirectUrl(_)
+                    | SourceDist::GitDirectory(_)
+                    | SourceDist::GitPath(_)
+                    | SourceDist::Path(_)
+                    | SourceDist::Directory(_),
+                ) => continue,
             };
-            let mut allowed_hashes = wheels
+            let files = wheels
                 .iter()
                 .filter(|_| !build_options.no_binary_package(&distribution.name))
-                .flat_map(|wheel| wheel.file.hashes.iter())
+                .map(|wheel| &wheel.file)
                 .chain(
                     sdist
                         .filter(|_| !build_options.no_build_package(&distribution.name))
                         .into_iter()
-                        .flat_map(|source| source.file.hashes.iter()),
-                )
-                .collect::<FxHashSet<_>>();
+                        .map(|source| &source.file),
+                );
+            let hashes = hashes.entry(index).or_default();
+            for file in files {
+                if file.hashes.is_empty() {
+                    missing.entry(&file.url).or_default().push(index);
+                } else {
+                    hashes.extend(file.hashes.iter().cloned());
+                }
+            }
+        }
 
-            // Flat indexes need not advertise hashes. A hash computed for this exact retained
-            // artifact is still eligible; hashes from another wheel used only for metadata are not.
-            let metadata_response = in_memory.distributions().get(&dist.distribution_id());
-            if let Some(response) = &metadata_response
-                && let MetadataResponse::Found(archive) = &**response
-            {
-                allowed_hashes.extend(archive.hashes.iter());
+        // A file shared by several forks, extras, or groups only needs to be hashed once.
+        let computed = futures::stream::iter(missing)
+            .map(|(location, indexes)| async move {
+                let hash = client.hash_file(&location.to_url()?).await?;
+                Ok::<_, FileHashError>((indexes, hash))
+            })
+            .buffer_unordered(concurrency)
+            .try_collect::<Vec<_>>()
+            .await?;
+        for (indexes, hash) in computed {
+            for index in indexes {
+                hashes.entry(index).or_default().push(hash.clone());
             }
-            let mut hashes = distribution
-                .hashes
-                .iter()
-                .filter(|hash| allowed_hashes.contains(hash))
-                .cloned()
-                .collect::<Vec<_>>();
-            if hashes.is_empty() {
-                hashes.extend(allowed_hashes.into_iter().cloned());
-                hashes.sort_unstable();
-            }
+        }
+        for (index, mut hashes) in hashes {
+            let ResolutionGraphNode::Dist(distribution) = &mut self.graph[index] else {
+                continue;
+            };
+            hashes.sort_unstable();
+            hashes.dedup();
             distribution.hashes = HashDigests::from(hashes);
         }
+        Ok(())
     }
 
     /// Returns `true` if the graph contains the given package.
